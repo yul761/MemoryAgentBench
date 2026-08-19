@@ -74,6 +74,12 @@ class AgentWrapper:
             self._initialize_cognee_agent(agent_config, dataset_config)
         elif self._is_agent_type("zep"):
             self._initialize_zep_agent(agent_config)
+        elif self._is_agent_type("knowl"):
+            from methods.knowl import initialize_knowl_agent
+            initialize_knowl_agent(self, agent_config)
+        elif self._is_agent_type("agentmemory"):
+            from methods.agentmemory import initialize_agentmemory_agent
+            initialize_agentmemory_agent(self, agent_config)
         elif self._is_agent_type("rag"):
             self._initialize_rag_agent(agent_config, dataset_config)
         else:
@@ -271,7 +277,7 @@ class AgentWrapper:
         # Route to appropriate agent handler based on agent type
         if 'Long_context_agent' in self.agent_name:
             return self._handle_long_context_agent(message, memorizing)
-        elif any(self._is_agent_type(agent_type) for agent_type in ["letta", "cognee", "mem0", "zep"]):
+        elif any(self._is_agent_type(agent_type) for agent_type in ["letta", "cognee", "mem0", "zep", "knowl", "agentmemory"]):
             return self._handle_memory_agent(message, memorizing, query_id, context_id)
         elif self._is_agent_type("rag"):
             return self._handle_rag_agent(message, memorizing, query_id, context_id)
@@ -406,6 +412,12 @@ class AgentWrapper:
             return self._handle_mem0_agent(message, memorizing, query_id, context_id)
         elif self._is_agent_type("zep"):
             return self._handle_zep_agent(message, memorizing, query_id, context_id)
+        elif self._is_agent_type("knowl"):
+            from methods.knowl import handle_knowl_agent
+            return handle_knowl_agent(self, message, memorizing, query_id, context_id)
+        elif self._is_agent_type("agentmemory"):
+            from methods.agentmemory import handle_agentmemory_agent
+            return handle_agentmemory_agent(self, message, memorizing, query_id, context_id)
         else:
             raise NotImplementedError(f"Memory agent type not supported: {self.agent_name}")
 
