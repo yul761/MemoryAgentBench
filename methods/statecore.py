@@ -186,31 +186,42 @@ class StateCoreClient:
         print(f"\nstatecore flush ({arm}): {self.facts} facts, {superseded} superseded at write\n")
         return {"facts": self.facts, "superseded": superseded}
 
-    def _settle(self, poll_seconds=5, stable_rounds=2, max_seconds=600):
+    def _settle(self, poll_seconds=5, stable_rounds=2, max_seconds=600, max_restarts=6):
         """Wait for the engine's background distillation to finish.
 
-        Threshold digests fire during ingestion but the last partial batch stays
-        pending, so restart the process once -- reopening the store runs a startup
-        catch-up pass that digests the tail -- then poll the `facts` tool until the
-        distilled state stops changing for `stable_rounds` consecutive reads. Time
+        Threshold digests fire during ingestion but leave a pending tail, and a
+        single startup catch-up pass digests one batch per scope -- with a large
+        backlog one pass is not the whole backlog. So: restart the process
+        (reopening the store runs a catch-up pass), poll the `facts` tool until
+        the distilled state stops changing for `stable_rounds` consecutive
+        reads, and repeat until a restart no longer changes the stable state --
+        that is the fixpoint where another pass has nothing left to digest. Time
         spent here is charged to memory_construction_time, where it belongs.
         """
-        self.mcp.close()
-        self.mcp = StateCoreMcpClient(self.data_dir, self.spec, self.extra_env)
         deadline = time.time() + max_seconds
-        previous = None
-        stable = 0
-        while time.time() < deadline:
-            snapshot = json.dumps(self.mcp.call_tool("facts", {}), sort_keys=True)
-            if snapshot == previous and snapshot != "[]":
-                stable += 1
-                if stable >= stable_rounds:
-                    return
+        settled_before_restart = None
+        for _ in range(max_restarts):
+            self.mcp.close()
+            self.mcp = StateCoreMcpClient(self.data_dir, self.spec, self.extra_env)
+            previous = None
+            stable = 0
+            while time.time() < deadline:
+                snapshot = json.dumps(self.mcp.call_tool("facts", {}), sort_keys=True)
+                if snapshot == previous and snapshot != "[]":
+                    stable += 1
+                    if stable >= stable_rounds:
+                        break
+                else:
+                    stable = 0
+                previous = snapshot
+                time.sleep(poll_seconds)
             else:
-                stable = 0
-            previous = snapshot
-            time.sleep(poll_seconds)
-        print("\nstatecore settle: hit max_seconds with distillation still moving; querying as-is\n")
+                print("\nstatecore settle: hit max_seconds with distillation still moving; querying as-is\n")
+                return
+            if previous == settled_before_restart:
+                return  # a fresh catch-up pass changed nothing: distillation is complete
+            settled_before_restart = previous
+        print("\nstatecore settle: hit max_restarts with distillation still moving; querying as-is\n")
 
     def query(self, text, k):
         result = self.mcp.call_tool("recall", {"query": text, "maxChars": 16000})
