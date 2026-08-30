@@ -142,8 +142,15 @@ class StateCoreClient:
         # environment the harness already has (the engine falls back to
         # OPENAI_API_KEY). The distillation model is the engine's recommended
         # gpt-5-mini -- its API is operated with gpt-5-class models.
+        # MODEL_TIMEOUT_MS: the engine's default LLM timeout is 20s, tuned for
+        # short interactive calls; a large-backlog distillation chunk on a
+        # reasoning model routinely exceeds it and the run dies as an abort.
         self.extra_env = (
-            {"FEATURE_LLM": "true", "MODEL_NAME": os.environ.get("STATECORE_MODEL_NAME", "gpt-5-mini")}
+            {
+                "FEATURE_LLM": "true",
+                "MODEL_NAME": os.environ.get("STATECORE_MODEL_NAME", "gpt-5-mini"),
+                "MODEL_TIMEOUT_MS": os.environ.get("STATECORE_MODEL_TIMEOUT_MS", "120000"),
+            }
             if digest
             else {}
         )
@@ -186,7 +193,7 @@ class StateCoreClient:
         print(f"\nstatecore flush ({arm}): {self.facts} facts, {superseded} superseded at write\n")
         return {"facts": self.facts, "superseded": superseded}
 
-    def _settle(self, poll_seconds=5, stable_rounds=2, max_seconds=600, max_restarts=6):
+    def _settle(self, poll_seconds=5, stable_rounds=2, max_seconds=None, max_restarts=20):
         """Wait for the engine's background distillation to finish.
 
         Threshold digests fire during ingestion but leave a pending tail, and a
@@ -198,9 +205,21 @@ class StateCoreClient:
         that is the fixpoint where another pass has nothing left to digest. Time
         spent here is charged to memory_construction_time, where it belongs.
         """
+        # A digest pass consumes a bounded batch (~40 events), so the number of
+        # passes needed is a function of how many facts were written -- computed,
+        # not guessed. The facts-snapshot fixpoint alone under-counts: on
+        # template-heavy corpora a fresh pass's output can be entirely deduped
+        # away, leaving the snapshot unchanged while a backlog remains (pending
+        # counts are not observable over MCP today).
+        if max_seconds is None:
+            max_seconds = int(os.environ.get("STATECORE_SETTLE_SECONDS", "3600"))
+        required_passes = (len(parse_fact_lines("".join(self.chunks))) // 40) + 2
+        max_restarts = max(max_restarts, required_passes)
         deadline = time.time() + max_seconds
         settled_before_restart = None
+        passes = 0
         for _ in range(max_restarts):
+            passes += 1
             self.mcp.close()
             self.mcp = StateCoreMcpClient(self.data_dir, self.spec, self.extra_env)
             previous = None
@@ -218,24 +237,29 @@ class StateCoreClient:
             else:
                 print("\nstatecore settle: hit max_seconds with distillation still moving; querying as-is\n")
                 return
-            if previous == settled_before_restart:
-                return  # a fresh catch-up pass changed nothing: distillation is complete
+            if previous == settled_before_restart and passes >= required_passes:
+                return  # enough passes for the backlog, and a fresh one changed nothing
             settled_before_restart = previous
         print("\nstatecore settle: hit max_restarts with distillation still moving; querying as-is\n")
 
     def query(self, text, k):
         result = self.mcp.call_tool("recall", {"query": text, "maxChars": 16000})
+        facts = [f["content"] for f in (result.get("factRegistry") or []) if f.get("content")]
+        events = [e["content"] for e in (result.get("events") or []) if e.get("content")]
+        # Interleave the two layers rather than concatenating facts-first: each
+        # layer is relevance-ranked by the engine, but distillation is selective
+        # -- on a partially distilled store, facts-first let a handful of facts
+        # crowd every event out of the top-k, and it was the event layer's
+        # lexical index doing the heavy lifting. Interleaving keeps the top of
+        # BOTH rankings inside the reader's window.
         contents = []
         if result.get("digest"):
             contents.append(result["digest"])
-        for fact in result.get("factRegistry") or []:
-            content = fact.get("content")
-            if content:
-                contents.append(content)
-        for event in result.get("events") or []:
-            content = event.get("content")
-            if content:
-                contents.append(content)
+        for pair in range(max(len(facts), len(events))):
+            if pair < len(facts):
+                contents.append(facts[pair])
+            if pair < len(events):
+                contents.append(events[pair])
         return contents[:k]
 
 
