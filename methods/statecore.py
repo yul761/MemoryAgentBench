@@ -12,15 +12,30 @@ installed into this venv and no service needs starting by hand; the only require
 >= 20 on PATH. The version is pinned so a run is reproducible from this file alone
 (STATECORE_MCP_SPEC overrides, for testing a newer release without editing it).
 
-ZERO MODEL CALLS ON THE MEMORY SIDE. Every other memory agent in this harness spends LLM calls
-on extraction or consolidation. StateCore's note path is deterministic: a write that reads as a
-revision of an active fact supersedes it in place (short-token-preserving similarity, so
-"deadline is May 3" vs "deadline is May 4" replaces rather than accumulates), and retrieval is
-lexical (ASCII words + CJK bigrams) over facts and events. The only LLM in the loop is the
-shared reader that every method uses. Whatever score this row gets is therefore the floor of
-the engine's LLM-assisted mode, bought at zero memory-side token cost -- that asymmetry is the
-point of the row, and it is stated here so nobody reads the comparison as like-for-like on
-spend.
+TWO ARMS, like the knowl pair. `statecore_digest` in the agent config picks the arm, so a run
+is reproducible from the config alone (STATECORE_DIGEST=1/0 overrides for one-off ablations):
+
+  * default (deterministic): zero model calls on the memory side. Writes take the note path --
+    a write that reads as a revision of an active fact supersedes it in place
+    (short-token-preserving similarity, so "deadline is May 3" vs "deadline is May 4" replaces
+    rather than accumulates) -- and retrieval is lexical (ASCII words + CJK bigrams) over facts
+    and events. The only LLM in the loop is the shared reader every method uses; this row's
+    score is the floor of the engine's LLM-assisted mode at zero memory-side token cost. The
+    known blind spot is entity substitution ("prefers X" vs "prefers Y"): low lexical overlap,
+    so both survive as active facts -- which is exactly what the digest arm is for.
+  * digest (LLM-assisted): writes are stored as events and the engine's own distillation runs
+    -- LLM extraction into supersession-tracked facts, semantic conflict resolution, entity
+    vocabulary. The spawned process gets FEATURE_LLM=true and inherits OPENAI_API_KEY (the same
+    key the harness already requires for the reader); the digest model is gpt-5-mini, the
+    engine's recommended distillation model (its runtime sends reasoning_effort, which the
+    gpt-4o family rejects, so the engine is operated with gpt-5-class models; STATECORE_MODEL_NAME
+    overrides). Distillation runs at a pending-events threshold during ingestion; flush then
+    restarts the process once (a startup catch-up pass digests the tail) and polls the `facts`
+    tool until the distilled state is stable before the first query.
+
+The delta between the two rows is the measured value of the engine's distillation -- that is
+the point of shipping both, and it is stated here so nobody reads either row alone as the
+system's spend-matched score.
 
 NORMALIZED INPUT. Identical to the knowl/agentmemory rows: the parsed fact list, in context
 order, one record per write, via `parse_fact_lines` (reused from methods.agentmemory). Same
@@ -54,7 +69,9 @@ class StateCoreMcpClient:
     child's stdout are enough; the first `npx -y` run downloads the package and generates its
     database client, which can take a minute -- later runs start in ~2s."""
 
-    def __init__(self, data_dir, spec):
+    def __init__(self, data_dir, spec, extra_env=None):
+        env = dict(os.environ)
+        env.update(extra_env or {})
         self.proc = subprocess.Popen(
             ["npx", "-y", spec, "--data", data_dir],
             stdin=subprocess.PIPE,
@@ -62,6 +79,7 @@ class StateCoreMcpClient:
             stderr=None,  # inherit: the server prints "[statecore-mcp] ready over stdio" there
             text=True,
             bufsize=1,
+            env=env,
         )
         self._next_id = 0
         self._request(
@@ -112,13 +130,24 @@ class StateCoreMcpClient:
 
 
 class StateCoreClient:
-    def __init__(self, spec):
+    def __init__(self, spec, digest=False):
         self.chunks = []
         self.flushed = False
         self.facts = 0
         self.superseded = 0
+        self.spec = spec
+        self.digest = digest
         self.data_dir = tempfile.mkdtemp(prefix="mab_statecore_")
-        self.mcp = StateCoreMcpClient(self.data_dir, spec)
+        # FEATURE_LLM gates the engine's own distillation; the key comes from the
+        # environment the harness already has (the engine falls back to
+        # OPENAI_API_KEY). The distillation model is the engine's recommended
+        # gpt-5-mini -- its API is operated with gpt-5-class models.
+        self.extra_env = (
+            {"FEATURE_LLM": "true", "MODEL_NAME": os.environ.get("STATECORE_MODEL_NAME", "gpt-5-mini")}
+            if digest
+            else {}
+        )
+        self.mcp = StateCoreMcpClient(self.data_dir, spec, self.extra_env)
 
     def add(self, text):
         self.chunks.append(text)
@@ -135,7 +164,11 @@ class StateCoreClient:
         facts = parse_fact_lines("".join(self.chunks))
         superseded = 0
         for fact in facts:
-            if len(fact) <= 500:
+            if self.digest:
+                # Event path: the engine's own distillation extracts and supersedes.
+                # Threshold digests run in the background while ingestion continues.
+                self.mcp.call_tool("remember", {"text": fact[:2000], "consolidate": True})
+            elif len(fact) <= 500:
                 result = self.mcp.call_tool("remember", {"text": fact})
                 if result.get("superseded") is not None:
                     superseded += 1
@@ -143,15 +176,47 @@ class StateCoreClient:
                 # Over the note cap: stored as an event -- retrievable, but outside supersession.
                 self.mcp.call_tool("remember", {"text": fact[:2000], "consolidate": True})
 
+        if self.digest:
+            self._settle()
+
         self.facts = len(facts)
         self.superseded = superseded
         self.flushed = True
-        print(f"\nstatecore flush: {self.facts} facts, {superseded} superseded at write\n")
+        arm = "digest" if self.digest else "note"
+        print(f"\nstatecore flush ({arm}): {self.facts} facts, {superseded} superseded at write\n")
         return {"facts": self.facts, "superseded": superseded}
+
+    def _settle(self, poll_seconds=5, stable_rounds=2, max_seconds=600):
+        """Wait for the engine's background distillation to finish.
+
+        Threshold digests fire during ingestion but the last partial batch stays
+        pending, so restart the process once -- reopening the store runs a startup
+        catch-up pass that digests the tail -- then poll the `facts` tool until the
+        distilled state stops changing for `stable_rounds` consecutive reads. Time
+        spent here is charged to memory_construction_time, where it belongs.
+        """
+        self.mcp.close()
+        self.mcp = StateCoreMcpClient(self.data_dir, self.spec, self.extra_env)
+        deadline = time.time() + max_seconds
+        previous = None
+        stable = 0
+        while time.time() < deadline:
+            snapshot = json.dumps(self.mcp.call_tool("facts", {}), sort_keys=True)
+            if snapshot == previous and snapshot != "[]":
+                stable += 1
+                if stable >= stable_rounds:
+                    return
+            else:
+                stable = 0
+            previous = snapshot
+            time.sleep(poll_seconds)
+        print("\nstatecore settle: hit max_seconds with distillation still moving; querying as-is\n")
 
     def query(self, text, k):
         result = self.mcp.call_tool("recall", {"query": text, "maxChars": 16000})
         contents = []
+        if result.get("digest"):
+            contents.append(result["digest"])
         for fact in result.get("factRegistry") or []:
             content = fact.get("content")
             if content:
@@ -170,8 +235,13 @@ def initialize_statecore_agent(agent, agent_config=None):
     agent.agent_start_time = time.time()
 
     spec = os.environ.get("STATECORE_MCP_SPEC", DEFAULT_SPEC)
-    agent.statecore = StateCoreClient(spec)
-    print(f"\n\nstatecore ({spec}) embedded at {agent.statecore.data_dir}\n\n")
+    digest = bool(config.get("statecore_digest", False))
+    override = os.environ.get("STATECORE_DIGEST")
+    if override is not None:
+        digest = override not in ("0", "false", "")
+    agent.statecore = StateCoreClient(spec, digest=digest)
+    arm = "digest" if digest else "note"
+    print(f"\n\nstatecore ({spec}, {arm} arm) embedded at {agent.statecore.data_dir}\n\n")
 
 
 def handle_statecore_agent(agent, message, memorizing, query_id, context_id):
