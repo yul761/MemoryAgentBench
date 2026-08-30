@@ -5,7 +5,7 @@ deterministic pipeline, a corrected fact supersedes its predecessor on a recorde
 (`supersededBy`), and retirement/discards are logged rather than silent. It is driven here
 through its published MCP front end -- the wrapper spawns
 
-    npx -y statecore-mcp@0.5.0 --data <fresh temp dir>
+    npx -y statecore-mcp@0.6.0 --data <fresh temp dir>
 
 and speaks JSON-RPC over stdio (newline-delimited, per the MCP stdio transport). Nothing is
 installed into this venv and no service needs starting by hand; the only requirement is Node
@@ -60,7 +60,7 @@ import time
 
 from methods.agentmemory import parse_fact_lines
 
-DEFAULT_SPEC = "statecore-mcp@0.5.0"
+DEFAULT_SPEC = "statecore-mcp@0.6.0"
 PROTOCOL_VERSION = "2025-06-18"
 
 
