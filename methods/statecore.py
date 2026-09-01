@@ -43,8 +43,11 @@ records, no system-specific extraction. Facts over the note path's 500-char cap 
 datasets) are stored as events instead -- still retrievable, just outside the supersession
 machinery.
 
-ISOLATION. Every run gets a fresh --data directory (its own SQLite file), so runs cannot see
-each other; the directory is a tempdir and is left for the OS to clean.
+ISOLATION. Every context gets a fresh --data directory (its own SQLite file), so contexts
+cannot see each other. The harness has no end-of-context hook, so cleanup is handoff-shaped:
+initializing the client for context N closes context N-1's server and deletes its store, and
+an atexit hook releases the last one -- at most one Node process and one tempdir are alive at
+any time on a multi-context split.
 
 READER. Mirrors `_handle_bm25_rag` via the shared knowl helpers, exactly like the agentmemory
 row: same query extraction, "Memory i:" labels, same system template. Retrieval contents are
@@ -52,8 +55,10 @@ the active facts recall returns (already relevance-ranked and budget-packed by t
 then raw events, truncated to retrieve_num.
 """
 
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -155,6 +160,13 @@ class StateCoreClient:
             else {}
         )
         self.mcp = StateCoreMcpClient(self.data_dir, spec, self.extra_env)
+
+    def close(self):
+        """Terminate the server and delete the store. Idempotent."""
+        if self.mcp is not None:
+            self.mcp.close()
+            self.mcp = None
+        shutil.rmtree(self.data_dir, ignore_errors=True)
 
     def add(self, text):
         self.chunks.append(text)
@@ -263,7 +275,25 @@ class StateCoreClient:
         return contents[:k]
 
 
+# main.py builds a fresh AgentWrapper per context and never releases the old one, so each
+# context would leak a Node process and a tempdir for the life of the run. Contexts are
+# processed sequentially, so a single module-level slot is enough: the next context's init
+# releases the previous context's client, and atexit releases the last.
+_active_client = None
+
+
+def _release_active_client():
+    global _active_client
+    if _active_client is not None:
+        _active_client.close()
+        _active_client = None
+
+
+atexit.register(_release_active_client)
+
+
 def initialize_statecore_agent(agent, agent_config=None):
+    global _active_client
     config = agent_config or {}
     agent.retrieve_num = config["retrieve_num"]
     agent.context = ""
@@ -274,7 +304,9 @@ def initialize_statecore_agent(agent, agent_config=None):
     override = os.environ.get("STATECORE_DIGEST")
     if override is not None:
         digest = override not in ("0", "false", "")
+    _release_active_client()
     agent.statecore = StateCoreClient(spec, digest=digest)
+    _active_client = agent.statecore
     arm = "digest" if digest else "note"
     print(f"\n\nstatecore ({spec}, {arm} arm) embedded at {agent.statecore.data_dir}\n\n")
 
