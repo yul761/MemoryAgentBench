@@ -80,6 +80,9 @@ class AgentWrapper:
         elif self._is_agent_type("agentmemory"):
             from methods.agentmemory import initialize_agentmemory_agent
             initialize_agentmemory_agent(self, agent_config)
+        elif self._is_agent_type("total_agent_memory"):
+            from methods.total_agent_memory import initialize_total_agent_memory_agent
+            initialize_total_agent_memory_agent(self, agent_config)
         elif self._is_agent_type("statecore"):
             from methods.statecore import initialize_statecore_agent
             initialize_statecore_agent(self, agent_config)
@@ -280,7 +283,7 @@ class AgentWrapper:
         # Route to appropriate agent handler based on agent type
         if 'Long_context_agent' in self.agent_name:
             return self._handle_long_context_agent(message, memorizing)
-        elif any(self._is_agent_type(agent_type) for agent_type in ["letta", "cognee", "mem0", "zep", "knowl", "agentmemory", "statecore"]):
+        elif any(self._is_agent_type(agent_type) for agent_type in ["letta", "cognee", "mem0", "zep", "knowl", "agentmemory", "total_agent_memory", "statecore"]):
             return self._handle_memory_agent(message, memorizing, query_id, context_id)
         elif self._is_agent_type("rag"):
             return self._handle_rag_agent(message, memorizing, query_id, context_id)
@@ -421,6 +424,9 @@ class AgentWrapper:
         elif self._is_agent_type("agentmemory"):
             from methods.agentmemory import handle_agentmemory_agent
             return handle_agentmemory_agent(self, message, memorizing, query_id, context_id)
+        elif self._is_agent_type("total_agent_memory"):
+            from methods.total_agent_memory import handle_total_agent_memory_agent
+            return handle_total_agent_memory_agent(self, message, memorizing, query_id, context_id)
         elif self._is_agent_type("statecore"):
             from methods.statecore import handle_statecore_agent
             return handle_statecore_agent(self, message, memorizing, query_id, context_id)
